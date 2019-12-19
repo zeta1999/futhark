@@ -472,7 +472,7 @@ internaliseExp desc (E.LetFun ofname (tparams, params, retdecl, Info rettype, bo
   internaliseValBind $ E.ValBind Nothing ofname retdecl (Info rettype) tparams params body Nothing loc
   internaliseExp desc letbody
 
-internaliseExp desc (E.DoLoop mergepat mergeexp form loopbody loc) = do
+internaliseExp desc (E.DoLoop sparams mergepat mergeexp form loopbody (Info (_, retext)) loc) = do
   -- We pretend that we saw a let-binding first to ensure that the
   -- initial values for the merge parameters match their annotated
   -- sizes
@@ -735,16 +735,18 @@ internaliseExp desc (E.If ce te fe _ _) =
 
 -- Builtin operators are handled specially because they are
 -- overloaded.
-internaliseExp desc (E.BinOp (op, _) _ (xe,_) (ye,_) _ loc)
+internaliseExp desc (E.BinOp (op, _) _ (xe,_) (ye,_) _ ext loc)
   | Just internalise <- isOverloadedFunction op [xe, ye] loc =
       internalise desc
 
 -- User-defined operators are just the same as a function call.
-internaliseExp desc (E.BinOp (op, oploc) (Info t) (xarg, Info xt) (yarg, Info yt) _ loc) =
+internaliseExp desc (E.BinOp (op, oploc) (Info t)
+                     (xarg, Info (xt,xext)) (yarg, Info (yt,yext))
+                     _ (Info retext) loc) =
   internaliseExp desc $
-  E.Apply (E.Apply (E.Var op (Info t) oploc) xarg (Info $ E.diet xt)
-           (Info $ foldFunType [E.fromStruct yt] t) loc)
-          yarg (Info $ E.diet yt) (Info t) loc
+  E.Apply (E.Apply (E.Var op (Info t) oploc) xarg (Info (E.diet xt, xext))
+           (Info $ foldFunType [E.fromStruct yt] t) (Info []) loc)
+          yarg (Info (E.diet yt, yext)) (Info t) (Info retext) loc
 
 internaliseExp desc (E.Project k e (Info rt) _) = do
   n <- internalisedTypeSize $ rt `setAliases` ()
@@ -1252,7 +1254,7 @@ findFuncall :: E.Exp -> InternaliseM (E.QualName VName, [E.Exp], [E.StructType])
 findFuncall (E.Var fname (Info t) _) =
   let (remaining, _) = unfoldFunType t
   in return (fname, [], map E.toStruct remaining)
-findFuncall (E.Apply f arg _ (Info t) _) = do
+findFuncall (E.Apply f arg _ (Info t) _ _) = do
   let (remaining, _) = unfoldFunType t
   (fname, args, _) <- findFuncall f
   return (fname, args ++ [arg], map E.toStruct remaining)

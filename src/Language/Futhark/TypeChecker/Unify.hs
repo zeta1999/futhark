@@ -169,6 +169,7 @@ instantiateEmptyArrayDims :: MonadUnify f =>
 instantiateEmptyArrayDims loc r = runWriterT . instantiate
   where instantiate t@Array{} = bitraverse onDim pure t
         instantiate (Scalar (Record fs)) = Scalar . Record <$> traverse instantiate fs
+        instantiate (Scalar (Sum fs)) = Scalar . Sum <$> traverse (mapM instantiate) fs
         instantiate t = return t
 
         onDim AnyDim = do v <- lift $ newDimVar loc r "impl_dim"
@@ -264,7 +265,8 @@ unifyWith onDims usage orig_t1 orig_t2 = do
 
         (Scalar (Arrow _ p1 a1 b1),
          Scalar (Arrow _ p2 a2 b2)) -> do
-          subunify ord bound a1 a2
+          (a2', _) <- instantiateEmptyArrayDims (srclocOf usage) Nonrigid a2
+          subunify ord bound a1 a2'
           subunify ord bound' b1' b2'
           where (b1', b2') =
                   -- Replace one parameter name with the other in the

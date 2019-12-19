@@ -241,11 +241,11 @@ transformExp (If e1 e2 e3 tp loc) = do
   tp' <- traverse transformType tp
   return $ If e1' e2' e3' tp' loc
 
-transformExp (Apply e1 e2 d tp loc) = do
+transformExp (Apply e1 e2 d tp ext loc) = do
   e1' <- transformExp e1
   e2' <- transformExp e2
   tp' <- traverse transformType tp
-  return $ Apply e1' e2' d tp' loc
+  return $ Apply e1' e2' d tp' ext loc
 
 transformExp (Negate e loc) =
   Negate <$> transformExp e <*> pure loc
@@ -275,20 +275,20 @@ transformExp (ProjectSection fields (Info t) loc) =
 transformExp (IndexSection idxs (Info t) loc) =
   desugarIndexSection idxs t loc
 
-transformExp (DoLoop pat e1 form e3 loc) = do
+transformExp (DoLoop sparams pat e1 form e3 ret loc) = do
   e1' <- transformExp e1
   form' <- case form of
     For ident e2  -> For ident <$> transformExp e2
     ForIn pat2 e2 -> ForIn pat2 <$> transformExp e2
     While e2      -> While <$> transformExp e2
   e3' <- transformExp e3
-  return $ DoLoop pat e1' form' e3' loc
+  return $ DoLoop sparams pat e1' form' e3' ret loc
 
-transformExp (BinOp (QualName qs fname, oploc) (Info t) (e1, d1) (e2, d2) tp loc) = do
+transformExp (BinOp (QualName qs fname, oploc) (Info t) (e1, d1) (e2, d2) tp ext loc) = do
   fname' <- transformFName fname (toStructural t)
   e1' <- transformExp e1
   e2' <- transformExp e2
-  return $ BinOp (QualName qs fname', oploc) (Info t) (e1', d1) (e2', d2) tp loc
+  return $ BinOp (QualName qs fname', oploc) (Info t) (e1', d1) (e2', d2) tp ext loc
 
 transformExp (Project n e tp loc) = do
   maybe_fs <- case e of
@@ -348,7 +348,9 @@ desugarBinOpSection :: QualName VName -> Maybe Exp -> Maybe Exp
 desugarBinOpSection qn e_left e_right t xtype ytype rettype loc = do
   (e1, p1) <- makeVarParam e_left $ fromStruct xtype
   (e2, p2) <- makeVarParam e_right $ fromStruct ytype
-  let body = BinOp (qn, loc) (Info t) (e1, Info xtype) (e2, Info ytype) (Info rettype) loc
+  let body = BinOp (qn, loc) (Info t)
+             (e1, Info (xtype, Nothing)) (e2, Info (ytype, Nothing))
+             (Info rettype) (Info []) loc
       rettype' = toStruct rettype
   return $ Lambda (p1 ++ p2) body Nothing (Info (mempty, rettype')) loc
 

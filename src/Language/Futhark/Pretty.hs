@@ -231,12 +231,12 @@ instance (Eq vn, IsName vn, Annot f) => Pretty (ExpBase f vn) where
       DownToExclusive end' -> text "..>" <> ppr end'
       ToInclusive     end' -> text "..." <> ppr end'
       UpToExclusive   end' -> text "..<" <> ppr end'
-  pprPrec p (BinOp (bop, _) _ (x,_) (y,_) _ _) = prettyBinOp p bop x y
+  pprPrec p (BinOp (bop,_) _ (x,_) (y,_) _ _ _) = prettyBinOp p bop x y
   pprPrec _ (Project k e _ _) = ppr e <> text "." <> ppr k
   pprPrec _ (If c t f _ _) = text "if" <+> ppr c </>
                              text "then" <+> align (ppr t) </>
                              text "else" <+> align (ppr f)
-  pprPrec p (Apply f arg _ _ _) =
+  pprPrec p (Apply f arg _ _ _ _) =
     parensIf (p >= 10) $ ppr f <+> pprPrec 10 arg
   pprPrec _ (Negate e _) = text "-" <> ppr e
   pprPrec p (LetPat pat e body _ _) =
@@ -298,9 +298,10 @@ instance (Eq vn, IsName vn, Annot f) => Pretty (ExpBase f vn) where
     where p name = text "." <> ppr name
   pprPrec _ (IndexSection idxs _ _) =
     parens $ text "." <> brackets (commasep (map ppr idxs))
-  pprPrec _ (DoLoop pat initexp form loopbody _) =
-    text "loop" <+> ppr pat <+>
-    equals <+> ppr initexp <+> ppr form <+> text "do" </>
+  pprPrec _ (DoLoop sizeparams pat initexp form loopbody _ _) =
+    text "loop" <+>
+    align (spread (map (brackets . pprName) sizeparams) <+/>
+           ppr pat <+> equals <+/> ppr initexp <+/> ppr form <+> text "do") </>
     indent 2 (ppr loopbody)
   pprPrec _ (Constr n cs _ _) = text "#" <> ppr n <+> sep (map ppr cs)
   pprPrec _ (Match e cs _ _) = text "match" <+> ppr e </> (stack . map ppr) (NE.toList cs)

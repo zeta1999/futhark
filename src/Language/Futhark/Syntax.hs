@@ -111,12 +111,15 @@ import           Language.Futhark.Core
 -- | Convenience class for deriving 'Show' instances for the AST.
 class (Show vn,
        Show (f VName),
-       Show (f Diet),
+       Show (f (Diet, Maybe VName)),
        Show (f String),
        Show (f [VName]),
+       Show (f ([VName], [VName])),
        Show (f PatternType),
+       Show (f (PatternType, [VName])),
        Show (f Int),
        Show (f StructType),
+       Show (f (StructType, Maybe VName)),
        Show (f (Aliasing, StructType)),
        Show (f (M.Map VName VName)),
        Show (f Uniqueness)) => Showable f vn where
@@ -633,7 +636,13 @@ data ExpBase f vn =
 
             | If     (ExpBase f vn) (ExpBase f vn) (ExpBase f vn) (f PatternType) SrcLoc
 
-            | Apply (ExpBase f vn) (ExpBase f vn) (f Diet) (f PatternType) SrcLoc
+            | Apply (ExpBase f vn) (ExpBase f vn)
+              (f (Diet, Maybe VName)) (f PatternType) (f [VName]) SrcLoc
+              -- ^ The @Maybe VName@ is a possible existential size
+              -- that is instantiated by this argument..
+              --
+              -- The @[VName]@ are the existential sizes that come
+              -- into being at this call site.
 
             | Negate (ExpBase f vn) SrcLoc
               -- ^ Numeric negation (ugly special case; Haskell did it first).
@@ -655,15 +664,18 @@ data ExpBase f vn =
               -- ^ Array indexing as a section: @(.[i,j])@.
 
             | DoLoop
-              (PatternBase f vn) -- Merge variable pattern
+              [VName] -- Size parameters.
+              (PatternBase f vn) -- Merge variable pattern.
               (ExpBase f vn) -- Initial values of merge variables.
               (LoopFormBase f vn) -- Do or while loop.
               (ExpBase f vn) -- Loop body.
+              (f (PatternType, [VName])) -- Return type.
               SrcLoc
 
             | BinOp (QualName vn, SrcLoc) (f PatternType)
-              (ExpBase f vn, f StructType) (ExpBase f vn, f StructType)
-              (f PatternType) SrcLoc
+              (ExpBase f vn, f (StructType, Maybe VName))
+              (ExpBase f vn, f (StructType, Maybe VName))
+              (f PatternType) (f [VName]) SrcLoc
 
             | Project Name (ExpBase f vn) (f PatternType) SrcLoc
 
@@ -709,12 +721,12 @@ instance Located (ExpBase f vn) where
   locOf (Project _ _ _ pos)            = locOf pos
   locOf (ArrayLit _ _ pos)             = locOf pos
   locOf (Range _ _ _ _ pos)            = locOf pos
-  locOf (BinOp _ _ _ _ _ pos)          = locOf pos
+  locOf (BinOp _ _ _ _ _ _ loc)        = locOf loc
   locOf (If _ _ _ _ pos)               = locOf pos
   locOf (Var _ _ loc)                  = locOf loc
   locOf (Ascript _ _ _ loc)            = locOf loc
   locOf (Negate _ pos)                 = locOf pos
-  locOf (Apply _ _ _ _ pos)            = locOf pos
+  locOf (Apply _ _ _ _ _ pos)          = locOf pos
   locOf (LetPat _ _ _ _ loc)           = locOf loc
   locOf (LetFun _ _ _ loc)             = locOf loc
   locOf (LetWith _ _ _ _ _ _ loc)      = locOf loc
@@ -727,7 +739,7 @@ instance Located (ExpBase f vn) where
   locOf (OpSectionRight _ _ _ _ _ loc) = locOf loc
   locOf (ProjectSection _ _ loc)       = locOf loc
   locOf (IndexSection _ _ loc)         = locOf loc
-  locOf (DoLoop _ _ _ _ pos)           = locOf pos
+  locOf (DoLoop _ _ _ _ _ _ loc)       = locOf loc
   locOf (Unsafe _ loc)                 = locOf loc
   locOf (Assert _ _ _ loc)             = locOf loc
   locOf (Constr _ _ _ loc)             = locOf loc

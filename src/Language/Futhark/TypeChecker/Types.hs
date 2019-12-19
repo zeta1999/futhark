@@ -475,6 +475,7 @@ substTypesAny lookupSubst ot = case ot of
 
   where subsTypeArg (TypeArgType t loc) =
           TypeArgType (substTypesAny lookupSubst' t) loc
-        subsTypeArg t = t
+        subsTypeArg (TypeArgDim v loc) =
+          TypeArgDim (applySubst lookupSubst' v) loc
 
         lookupSubst' = fmap (fmap $ second (const ())) . lookupSubst

@@ -29,6 +29,7 @@ import Codec.Binary.UTF8.String (encode)
 import Data.Char (ord)
 import Data.Maybe (fromMaybe, fromJust)
 import Data.Loc hiding (L) -- Lexer has replacements.
+import Data.List (genericLength)
 import qualified Data.List.NonEmpty as NE
 import qualified Data.Map.Strict as M
 import Data.Monoid
@@ -530,10 +531,10 @@ Exp2 :: { UncheckedExp }
                       { If $2 $4 $6 NoInfo (srcspan $1 $>) }
 
      | loop Pattern LoopForm do Exp %prec ifprec
-         {% fmap (\t -> DoLoop $2 t $3 $5 (srcspan $1 $>)) (patternExp $2) }
+         {% fmap (\t -> DoLoop [] $2 t $3 $5 NoInfo (srcspan $1 $>)) (patternExp $2) }
 
      | loop Pattern '=' Exp LoopForm do Exp %prec ifprec
-         { DoLoop $2 $4 $5 $7 (srcspan $1 $>) }
+         { DoLoop [] $2 $4 $5 $7 NoInfo (srcspan $1 $>) }
 
      | LetExp %prec letprec { $1 }
 
@@ -571,7 +572,7 @@ Exp2 :: { UncheckedExp }
      | Exp2 '<|...' Exp2   { binOp $1 $2 $3 }
 
      | Exp2 '<' Exp2              { binOp $1 (L $2 (SYMBOL Less [] (nameFromString "<"))) $3 }
-     | Exp2 '`' QualName '`' Exp2 { BinOp $3 NoInfo ($1, NoInfo) ($5, NoInfo) NoInfo (srcspan $1 $>) }
+     | Exp2 '`' QualName '`' Exp2 { BinOp $3 NoInfo ($1, NoInfo) ($5, NoInfo) NoInfo NoInfo (srcspan $1 $>) }
 
      | Exp2 '...' Exp2           { Range $1 Nothing (ToInclusive $3) NoInfo (srcspan $1 $>) }
      | Exp2 '..<' Exp2           { Range $1 Nothing (UpToExclusive $3) NoInfo (srcspan $1 $>) }
@@ -598,7 +599,7 @@ Exp2 :: { UncheckedExp }
 Apply_ :: { UncheckedExp }
        : ApplyList { case $1 of
                        ((Constr n [] _ loc1):_) -> Constr n (tail $1) NoInfo (srcspan loc1 (last $1))
-                       _                -> foldl1 (\f x -> Apply f x NoInfo NoInfo (srcspan f x)) $1 }
+                       _                -> foldl1 (\f x -> Apply f x NoInfo NoInfo NoInfo (srcspan f x)) $1 }
 
 ApplyList :: { [UncheckedExp] }
           : ApplyList Atom %prec juxtprec
@@ -934,12 +935,14 @@ FloatLit :: { (FloatValue, SrcLoc) }
 
 ArrayValue :: { Value }
 ArrayValue :  '[' Value ']'
-             {% return $ ArrayValue (arrayFromList [$2]) $ toStruct $ valueType $2
+             {% return $ ArrayValue (arrayFromList [$2]) $
+                arrayOf (valueType $2) (ShapeDecl [1]) Unique
              }
            |  '[' Value ',' Values ']'
              {% case combArrayElements $2 $4 of
                   Left e -> throwError e
-                  Right v -> return $ ArrayValue (arrayFromList $ $2:$4) $ valueType v
+                  Right v -> return $ ArrayValue (arrayFromList $ $2:$4) $
+                             arrayOf (valueType $2) (ShapeDecl [1 + genericLength $4]) Unique
              }
            | id '(' RowType ')'
              {% ($1 `mustBe` "empty") >> mustBeEmpty (srcspan $2 $4) $3 >> return (ArrayValue (listArray (0,-1) []) $3) }
@@ -1063,7 +1066,7 @@ eof pos = L (SrcLoc $ Loc pos pos) EOF
 binOpName (L loc (SYMBOL _ qs op)) = (QualName qs op, loc)
 
 binOp x (L loc (SYMBOL _ qs op)) y =
-  BinOp (QualName qs op, loc) NoInfo (x, NoInfo) (y, NoInfo) NoInfo $
+  BinOp (QualName qs op, loc) NoInfo (x, NoInfo) (y, NoInfo) NoInfo NoInfo $
   srcspan x y
 
 getTokens :: ParserMonad ([L Token], Pos)

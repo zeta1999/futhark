@@ -21,12 +21,11 @@ import qualified Debug.Trace
 import Control.Monad.Trans.Maybe
 import Control.Monad.Free.Church
 import Control.Monad.Except
+import Control.Monad.State
 import Control.Monad.Reader
 import qualified Control.Monad.Fail as Fail
 import Data.Array
 import Data.Bifunctor (first)
-import Data.Bitraversable
-import Data.Foldable (fold)
 import Data.List hiding (break)
 import Data.Maybe
 import qualified Data.Map as M
@@ -60,18 +59,21 @@ data StackFrame = StackFrame { stackFrameSrcLoc :: SrcLoc
 
 type Stack = [StackFrame]
 
+type Sizes = M.Map VName Int32
+
 -- | The monad in which evaluation takes place.
 newtype EvalM a = EvalM (ReaderT (Stack, M.Map FilePath Env)
-                         (F ExtOp) a)
+                         (StateT Sizes (F ExtOp)) a)
   deriving (Monad, Applicative, Functor,
             MonadFree ExtOp,
-            MonadReader (Stack, M.Map FilePath Env))
+            MonadReader (Stack, M.Map FilePath Env),
+            MonadState Sizes)
 
 instance Fail.MonadFail EvalM where
   fail = error
 
 runEvalM :: M.Map FilePath Env -> EvalM a -> F ExtOp a
-runEvalM imports (EvalM m) = runReaderT m (mempty, imports)
+runEvalM imports (EvalM m) = evalStateT (runReaderT m (mempty, imports)) mempty
 
 stacking :: SrcLoc -> Env -> EvalM a -> EvalM a
 stacking loc env = local $ \(ss, imports) ->
@@ -85,6 +87,15 @@ stacktrace = asks $ map stackFrameSrcLoc . reverse . fst
 lookupImport :: FilePath -> EvalM (Maybe Env)
 lookupImport f = asks $ M.lookup f . snd
 
+putExtSize :: VName -> Int32 -> EvalM ()
+putExtSize v x = modify $ M.insert v x
+
+getSizes :: EvalM Sizes
+getSizes = get
+
+extSizeEnv :: EvalM Env
+extSizeEnv = i32Env <$> getSizes
+
 prettyRecord :: Pretty a => M.Map Name a -> Doc
 prettyRecord m
   | Just vs <- areTupleFields m =
@@ -92,6 +103,9 @@ prettyRecord m
   | otherwise =
       braces $ commasep $ map field $ M.toList m
       where field (k, v) = ppr k <+> equals <+> ppr v
+
+valueStructType :: ValueType -> StructType
+valueStructType = first (ConstDim . fromIntegral)
 
 -- | A shape is a tree to accomodate the case of records.  It is
 -- parameterised over the representation of dimensions.
@@ -116,20 +130,6 @@ emptyShape :: ValueShape -> Bool
 emptyShape (ShapeDim d s) = d == 0 || emptyShape s
 emptyShape _ = False
 
-rowShape :: Shape d -> Shape d
-rowShape (ShapeDim _ shape) = shape
-rowShape shape = shape
-
-projectShape :: [Name] -> Shape d -> Shape d
-projectShape (k:ks) (ShapeRecord fields)
-  | Just shape <- M.lookup k fields =
-      projectShape ks shape
-projectShape _ shape = shape
-
-stripShapeDims :: Int -> Shape d -> Shape d
-stripShapeDims 0 shape = shape
-stripShapeDims i shape = stripShapeDims (i-1) $ rowShape shape
-
 typeShape :: M.Map VName (Shape d) -> TypeBase d () -> Shape d
 typeShape shapes = go
   where go (Array _ _ et shape) =
@@ -150,12 +150,53 @@ structTypeShape shapes = fmap dim . typeShape shapes'
         dim _ = Nothing
         shapes' = M.map (fmap $ ConstDim . fromIntegral) shapes
 
+resolveTypeParams :: [VName] -> StructType -> StructType -> Env
+resolveTypeParams names = match
+  where match (Scalar (TypeVar _ _ tn _)) t
+          | typeLeaf tn `elem` names =
+              typeEnv $ M.singleton (typeLeaf tn) t
+        match (Scalar (Record poly_fields)) (Scalar (Record fields)) =
+          mconcat $ M.elems $
+          M.intersectionWith match poly_fields fields
+        match (Scalar (Sum poly_fields)) (Scalar (Sum fields)) =
+          mconcat $ map mconcat $ M.elems $
+          M.intersectionWith (zipWith match) poly_fields fields
+        match (Scalar (Arrow _ _  poly_t1 poly_t2)) (Scalar (Arrow _ _ t1 t2)) =
+          match poly_t1 t1 <> match poly_t2 t2
+        match poly_t t
+          | d1 : _ <- shapeDims (arrayShape poly_t),
+            d2 : _ <- shapeDims (arrayShape t) =
+              matchDims d1 d2 <> match (stripArray 1 poly_t) (stripArray 1 t)
+        match _ _ = mempty
+
+        matchDims (NamedDim (QualName _ d1)) (ConstDim d2)
+          | d1 `elem` names =
+              i32Env $ M.singleton d1 $ fromIntegral d2
+        matchDims _ _ = mempty
+
+resolveExistentials :: [VName] -> StructType -> ValueShape -> M.Map VName Int32
+resolveExistentials names = match
+  where match (Scalar (Record poly_fields)) (ShapeRecord fields) =
+          mconcat $ M.elems $
+          M.intersectionWith match poly_fields fields
+        match (Scalar (Sum poly_fields)) (ShapeSum fields) =
+          mconcat $ map mconcat $ M.elems $
+          M.intersectionWith (zipWith match) poly_fields fields
+        match poly_t (ShapeDim d2 rowshape)
+          | d1 : _ <- shapeDims (arrayShape poly_t) =
+              matchDims d1 d2 <> match (stripArray 1 poly_t) rowshape
+        match _ _ = mempty
+
+        matchDims (NamedDim (QualName _ d1)) d2
+          | d1 `elem` names = M.singleton d1 d2
+        matchDims _ _ = mempty
+
 -- | A fully evaluated Futhark value.
 data Value = ValuePrim !PrimValue
            | ValueArray ValueShape !(Array Int Value)
              -- Stores the full shape.
            | ValueRecord (M.Map Name Value)
-           | ValueFun (Maybe (ValueShape -> ValueShape)) (Value -> EvalM Value)
+           | ValueFun (Value -> EvalM Value)
            | ValueSum ValueShape Name [Value]
              -- Stores the full shape.
 
@@ -206,41 +247,6 @@ checkShape (ShapeSum shapes1) ShapeLeaf =
   Just $ fromMaybe 0 <$> ShapeSum shapes1
 checkShape _ shape2 =
   Just shape2
-
-imposeShape :: ValueShape -> Value -> Value
-imposeShape (ShapeDim d shape1) (ValueArray _ arr) =
-  ValueArray (ShapeDim d shape1) $ fmap (imposeShape shape1) arr
-imposeShape (ShapeRecord shapes) (ValueRecord fs) =
-  ValueRecord $ M.intersectionWith imposeShape shapes fs
-imposeShape (ShapeSum shapes) (ValueSum _ c vs)
-  | Just c_shapes <- M.lookup c shapes =
-      ValueSum (ShapeSum shapes) c $ zipWith imposeShape c_shapes vs
-imposeShape _ v =
-  v
-
-matchDims :: Shape (DimDecl VName) -> ValueShape -> M.Map VName Int32
-matchDims (ShapeDim d1 shape1) (ShapeDim d2 shape2) =
-  match d1 <> matchDims shape1 shape2
-  where match (NamedDim (QualName [] v)) = M.singleton v d2
-        match _                          = mempty
-matchDims (ShapeRecord shapes1) (ShapeRecord shapes2) =
-  mconcat $ M.elems $ M.intersectionWith matchDims shapes1 shapes2
-matchDims (ShapeSum shapes1) (ShapeSum shapes2) =
-  mconcat $ M.elems $ M.map (mconcat . map (uncurry matchDims)) $
-  M.intersectionWith zip shapes1 shapes2
-matchDims _ _ =
-  mempty
-
-matchTypeShapes :: StructType -> ValueShape -> M.Map VName ValueShape
-matchTypeShapes (Array _ _ et tshape) vshape =
-  matchTypeShapes (Scalar et) $ stripShapeDims (shapeRank tshape) vshape
-matchTypeShapes (Scalar (TypeVar _ _ tname [])) vshape =
-  M.singleton (typeLeaf tname) vshape
-matchTypeShapes (Scalar (Record tfields)) (ShapeRecord vfields) =
-  fold $ M.intersectionWith matchTypeShapes tfields vfields
-matchTypeShapes (Scalar (Sum tconstrs)) (ShapeSum vconstrs) =
-  fold $ fold $ M.intersectionWith (zipWith matchTypeShapes) tconstrs vconstrs
-matchTypeShapes _ _ = mempty
 
 -- | Does the value correspond to an empty array?
 isEmptyArray :: Value -> Bool
@@ -313,6 +319,8 @@ lookupType = lookupInEnv envType
 
 -- | A TermValue with a 'Nothing' type annotation is an intrinsic.
 data TermBinding = TermValue (Maybe T.BoundV) Value
+                 | TermPoly (Maybe T.BoundV) (StructType -> EvalM Value)
+                   -- ^ A polymorphic value that must be instantiated.
                  | TermModule Module
 
 data Module = Module Env
@@ -353,12 +361,10 @@ typeEnv m = Env { envTerm = mempty
                 }
   where tbind = T.TypeAbbr Unlifted []
 
-
-shapeEnv :: M.Map VName ValueShape -> Env
-shapeEnv m = Env { envTerm = mempty
-                 , envType = mempty
-                 , envShapes = m
-                 }
+i32Env :: M.Map VName Int32 -> Env
+i32Env = valEnv . M.map f
+  where f x = (Just $ T.BoundV [] $ Scalar $ Prim $ Signed Int32,
+               ValuePrim $ SignedValue $ Int32Value x)
 
 instance Show InterpreterError where
   show (InterpreterError s) = s
@@ -415,7 +421,7 @@ toArray' rowshape vs = ValueArray shape (listArray (0, length vs - 1) vs)
   where shape = ShapeDim (genericLength vs) rowshape
 
 apply :: SrcLoc -> Env -> Value -> Value -> EvalM Value
-apply loc env (ValueFun rt f) v = stacking loc env (f v)
+apply loc env (ValueFun f) v = stacking loc env (f v)
 apply _ _ f _ = error $ "Cannot apply non-function: " ++ pretty f
 
 apply2 :: SrcLoc -> Env -> Value -> Value -> Value -> EvalM Value
@@ -429,24 +435,12 @@ matchPattern env p v = do
     Nothing   -> error $ "matchPattern: missing case for " ++ pretty p ++ " and " ++ pretty v
     Just env' -> return env'
 
-dimsEnv :: StructType -> ValueShape -> Env
-dimsEnv t shape =
-  valEnv (M.map f $ matchDims (typeShape mempty t) shape)
-  where f d = (Just $ T.BoundV [] $ Scalar $ Prim $ Signed Int32,
-               ValuePrim $ SignedValue $ Int32Value d)
-
-paramEnv :: StructType -> ValueShape -> Env
-paramEnv t shape =
-  dimsEnv t shape <> shapeEnv (matchTypeShapes t shape)
-
 patternMatch :: Env -> Pattern -> Value -> MaybeT EvalM Env
 patternMatch env (Id v (Info t) _) val =
   lift $ pure $
-  valEnv (M.singleton v (Just $ T.BoundV [] $ toStruct t, val)) <>
-  paramEnv (evalType env (toStruct t)) (valueShape val) <>
-  env
-patternMatch env (Wildcard (Info t) _) v =
-  lift $ pure $ paramEnv (evalType env (toStruct t)) (valueShape v) <> env
+  valEnv (M.singleton v (Just $ T.BoundV [] $ toStruct t, val)) <> env
+patternMatch env Wildcard{} _ =
+  lift $ pure env
 patternMatch env (TuplePattern ps _) (ValueRecord vs)
   | length ps == length vs' =
       foldM (\env' (p,v) -> patternMatch env' p v) env $
@@ -610,41 +604,19 @@ evalType env t@(Scalar (TypeVar () _ tn args)) =
         matchPtoA _ _ = mempty
 evalType env (Scalar (Sum cs)) = Scalar $ Sum $ (fmap . fmap) (evalType env) cs
 
-evalTypeFully :: Env -> TypeBase (DimDecl VName) als -> Maybe ValueType
-evalTypeFully env = bitraverse onDim pure . evalType env . toStruct
-  where onDim (ConstDim x) = Just $ fromIntegral x
-        onDim _            = Nothing
-
 evalTermVar :: Env -> QualName VName -> StructType -> EvalM Value
 evalTermVar env qv t =
-  case (lookupVar qv env, evalTypeFully env t) of
---    (Just (TermValue tparams (ValueFun Nothing f)),
---     Just (Scalar (Arrow _ _ _ rt))) -> return $ ValueFun (Just rt) f
-    (Just (TermValue _ v), _) -> return v
+  case lookupVar qv env of
+    Just (TermPoly _ v) -> do size_env <- extSizeEnv
+                              let msg = unwords [pretty qv, pretty t, pretty $ evalType (size_env <> env) t]
+                              v $ evalType (size_env <> env) t
+    Just (TermValue _ v) -> return v
     _ -> error $ "`" <> pretty qv <> "` is not bound to a value."
 
 typeValueShape :: Env -> StructType -> ValueShape
 typeValueShape env = fmap dim . typeShape mempty . evalType env
   where dim (ConstDim x) = fromIntegral x
         dim d = error $ "nope: " ++ show d
-
-returnTypeShape env rettype =
-  typeShape (envShapes env) <$> evalTypeFully env rettype
-
-valueFun :: Env
-         -> StructType -> StructType
-         -> (Value -> EvalM Value)
-         -> EvalM Value
-valueFun env ptype rettype m =
---  Debug.Trace.trace (unlines [show ptype, show rettype]) $
-  return $ ValueFun ((const <$> returnTypeShape env rettype) `mplus` match) m
-  where ptype_dims = nestedDims ptype
-        match
-          | all (`elem` ptype_dims) $ nestedDims rettype =
-              Just $ \pshape ->
-              let env' = paramEnv ptype pshape <> env
-              in typeValueShape env' rettype
-          | otherwise = Nothing
 
 evalFunction :: Env -> [Pattern] -> Exp -> StructType -> EvalM Value
 
@@ -657,7 +629,7 @@ evalFunction env [] body rettype =
   -- Eta-expand the rest to make any sizes visible.
   etaExpand [] env rettype
   where etaExpand vs env' (Scalar (Arrow _ _ pt rt)) =
-          return $ ValueFun Nothing $ \v -> do
+          return $ ValueFun $ \v -> do
           env'' <- matchPattern env' (Wildcard (Info $ fromStruct pt) noLoc) v
           etaExpand (v:vs) env'' rt
         etaExpand vs env' _ = do
@@ -665,27 +637,38 @@ evalFunction env [] body rettype =
           foldM (apply noLoc mempty) f $ reverse vs
 
 evalFunction env (p:ps) body rettype =
-  valueFun env (patternStructType p) rettype $ \v -> do
+  return $ ValueFun $ \v -> do
     env' <- matchPattern env p v
     evalFunction env' ps body rettype
 
-postApply :: SrcLoc -> Env -> Value -> PatternType -> EvalM Value
-postApply loc env v t = return v
-postApply loc env v t = do
-  let t' = evalType env $ toStruct t
-  case checkShape (structTypeShape (envShapes env) t') (valueShape v) of
-    Nothing -> fail $ unlines ["Unexpected return value at " ++ locStr loc,
-                               "Value shape: " ++ pretty (valueShape v),
---                               "Expected shape: " ++ pretty (structTypeShape t'),
-                               show t, show t']
-    Just shape -> do
-      let msg = unlines ["application: " ++ locStr loc,
---                         "value: " ++ pretty v,
---                         "return shape: " ++ show (structTypeShape t'),
-                         "value shape: " ++ show (valueShape v),
-                         "combined/imposing shape: " ++ show shape,
-                         "resulting value shape: " ++ pretty (valueShape $ imposeShape shape v)]
-      return $ imposeShape shape v
+evalFunctionBinding :: Env
+                    -> [TypeParam] -> [Pattern] -> StructType -> Exp
+                    -> EvalM TermBinding
+evalFunctionBinding env tparams ps ret fbody = do
+  let ret' = evalType env ret
+      arrow (xp, xt) yt = Scalar $ Arrow () xp xt yt
+      ftype = foldr (arrow . patternParam) ret' ps
+
+  -- Distinguish polymorphic and non-polymorphic bindings here.
+  if null tparams
+  then TermValue (Just $ T.BoundV [] ftype) <$> evalFunction env ps fbody ret'
+  else return $ TermPoly (Just $ T.BoundV [] ftype) $ \ftype' ->
+         let tparam_names = map typeParamName tparams
+             env' = resolveTypeParams tparam_names ftype ftype' <> env
+         in evalFunction env' ps fbody ret'
+
+evalArg :: Env -> Exp -> Maybe VName -> EvalM Value
+evalArg env e ext = do
+  v <- eval env e
+  case ext of Just ext' -> putExtSize ext' $ asInt32 v
+              Nothing -> return ()
+  return v
+
+returned :: Env -> PatternType -> [VName] -> Value -> EvalM Value
+returned env ret retext v = do
+  mapM_ (uncurry putExtSize) $ M.toList $
+    resolveExistentials retext (evalType env $ toStruct ret) $ valueShape v
+  return v
 
 eval :: Env -> Exp -> EvalM Value
 
@@ -755,11 +738,9 @@ eval env (LetPat p e body _ _) = do
   env' <- matchPattern env p v
   eval env' body
 
-eval env (LetFun f (_, pats, _, Info ret, fbody) body _) = do
-  v <- evalFunction env pats fbody ret
-  let arrow (xp, xt) yt = Scalar $ Arrow () xp xt yt
-      ftype = T.BoundV [] $ foldr (arrow . patternParam) ret pats
-  eval (valEnv (M.singleton f (Just ftype, v)) <> env) body
+eval env (LetFun f (tparams, ps, _, Info ret, fbody) body _) = do
+  binding <- evalFunctionBinding env tparams ps ret fbody
+  eval (env { envTerm = M.insert f binding $ envTerm env }) body
 
 eval _ (IntLit v (Info t) _) =
   case t of
@@ -777,7 +758,9 @@ eval _ (FloatLit v (Info t) _) =
       return $ ValuePrim $ FloatValue $ floatValue ft v
     _ -> error $ "eval: nonsensical type for float literal: " ++ pretty t
 
-eval env (BinOp (op, _) op_t (x, _) (y, _) (Info t) loc)
+eval env (BinOp (op, _) op_t
+          (x, Info (_, xext)) (y, Info (_, yext))
+          (Info t) (Info retext) loc)
   | baseString (qualLeaf op) == "&&" = do
       x' <- asBool <$> eval env x
       if x'
@@ -790,21 +773,20 @@ eval env (BinOp (op, _) op_t (x, _) (y, _) (Info t) loc)
         else eval env y
   | otherwise = do
       op' <- eval env $ Var op op_t loc
-      x' <- eval env x
-      y' <- eval env y
-      v <- apply2 loc env op' x' y'
-      postApply loc env v t
+      x' <- evalArg env x xext
+      y' <- evalArg env y yext
+      returned env t retext =<< apply2 loc env op' x' y'
 
 eval env (If cond e1 e2 _ _) = do
   cond' <- asBool <$> eval env cond
   if cond' then eval env e1 else eval env e2
 
-eval env (Apply f x _ (Info t) loc) = do
+eval env (Apply f x (Info (_, ext)) (Info t) (Info retext) loc) = do
+  -- It is important that 'x' is evaluated first in order to bring any
+  -- sizes into scope that may be used in the type of 'f'.
+  x' <- evalArg env x ext
   f' <- eval env f
-  x' <- eval env x
-  let msg = unlines ["apply", take 100 (pretty f), pretty f', pretty x']
-  v <- apply loc env f' x'
-  postApply loc env v t
+  returned env t retext =<< apply loc env f' x'
 
 eval env (Negate e _) = do
   ev <- eval env e
@@ -854,42 +836,45 @@ eval env (LetWith dest src is v body _ loc) = do
 -- can never occur in a well-formed Futhark program, but they are
 -- convenient in the interpreter.
 eval env (Lambda ps body _ (Info (_, rt)) _) =
-  Debug.Trace.trace (pretty (unwords ["lambda return", pretty rt, pretty (evalType env rt)])) evalFunction env ps body rt
+  evalFunction env ps body rt
 
 eval env (OpSection qv (Info t) _) = evalTermVar env qv $ toStruct t
 
-eval env (OpSectionLeft qv _ e _ (Info t) loc) = do
-  v <- join $ apply loc env <$> evalTermVar env qv (toStruct t) <*> eval env e
-  postApply loc env v t
+eval env (OpSectionLeft qv _ e _ (Info t) loc) =
+  join $ apply loc env <$> evalTermVar env qv (toStruct t) <*> eval env e
 
 eval env (OpSectionRight qv _ e (Info ptype, Info rettype) (Info t) loc) = do
   f <- evalTermVar env qv $ toStruct t
   y <- eval env e
-  Debug.Trace.trace (unlines [show rettype, show (returnTypeShape env rettype)]) $ valueFun env ptype rettype $ \x -> do
-    v <- join $ apply loc env <$> apply loc env f x <*> pure y
-    postApply loc env v t
+  return $ ValueFun $ \x ->
+    join $ apply loc env <$> apply loc env f x <*> pure y
 
 eval env (IndexSection is _ loc) = do
   is' <- mapM (evalDimIndex env) is
-  return $ ValueFun Nothing $ evalIndex loc env is'
+  return $ ValueFun $ evalIndex loc env is'
 
 eval _ (ProjectSection ks _ _) =
-  return $ ValueFun (Just $ projectShape ks) $ flip (foldM walk) ks
+  return $ ValueFun $ flip (foldM walk) ks
   where walk (ValueRecord fs) f
           | Just v' <- M.lookup f fs = return v'
         walk _ _ = fail "Value does not have expected field."
 
-eval env (DoLoop pat init_e form body _) = do
+eval env (DoLoop sparams pat init_e form body (Info (ret, retext)) _) = do
   init_v <- eval env init_e
-  case form of For iv bound -> do
-                 bound' <- asSigned <$> eval env bound
-                 forLoop (identName iv) bound' (zero bound') init_v
-               ForIn in_pat in_e -> do
-                 (_, in_vs) <- fromArray <$> eval env in_e
-                 foldM (forInLoop in_pat) init_v in_vs
-               While cond ->
-                 whileLoop cond init_v
-  where withLoopParams = matchPattern env pat
+  returned env ret retext =<<
+    case form of For iv bound -> do
+                   bound' <- asSigned <$> eval env bound
+                   forLoop (identName iv) bound' (zero bound') init_v
+                 ForIn in_pat in_e -> do
+                   (_, in_vs) <- fromArray <$> eval env in_e
+                   foldM (forInLoop in_pat) init_v in_vs
+                 While cond ->
+                   whileLoop cond init_v
+  where withLoopParams v =
+          let sparams' =
+                resolveExistentials sparams
+                (patternStructType pat) (valueShape v)
+          in matchPattern (i32Env sparams' <> env) pat v
 
         inc = (`P.doAdd` Int64Value 1)
         zero = (`P.doMul` Int64Value 0)
@@ -962,6 +947,7 @@ substituteInModule substs = onModule
     onModule (ModuleFun f) =
       ModuleFun $ \m -> onModule <$> f (substituteInModule rev_substs m)
     onTerm (TermValue t v) = TermValue t v
+    onTerm (TermPoly t v) = TermPoly t v
     onTerm (TermModule m) = TermModule $ onModule m
     onType (T.TypeAbbr l ps t) = T.TypeAbbr l ps $ first onDim t
     onDim (NamedDim v) = NamedDim $ replaceQ v
@@ -1013,12 +999,9 @@ evalModExp env (ModApply f e (Info psubst) (Info rsubst) _) = do
 
 evalDec :: Env -> Dec -> EvalM Env
 
-evalDec env (ValDec (ValBind _ v _ (Info t) _ ps def _ _)) = do
-  let t' = evalType env t
-      arrow (xp, xt) yt = Scalar $ Arrow () xp xt yt
-      ftype = T.BoundV [] $ foldr (arrow . patternParam) t' ps
-  val <- evalFunction env ps def t'
-  return $ valEnv (M.singleton v (Just ftype, val)) <> env
+evalDec env (ValDec (ValBind _ v _ (Info ret) tparams ps fbody _ _)) = do
+  binding <- evalFunctionBinding env tparams ps ret fbody
+  return $ env { envTerm = M.insert v binding $ envTerm env }
 
 evalDec env (OpenDec me _) = do
   Module me' <- evalModExp env me
@@ -1112,26 +1095,26 @@ initialCtx =
     putB (P.BoolValue x) = Just $ BoolValue x
     putB _               = Nothing
 
-    fun1 shape f =
-      TermValue Nothing $ ValueFun shape $ \x -> f x
-    fun2 shape f =
-      TermValue Nothing $ ValueFun Nothing $ \x ->
-      return $ ValueFun shape $ \y -> f x y
+    fun1 f =
+      TermValue Nothing $ ValueFun $ \x -> f x
+    fun2 f =
+      TermValue Nothing $ ValueFun $ \x ->
+      return $ ValueFun $ \y -> f x y
     fun2t f =
-      TermValue Nothing $ ValueFun Nothing $ \v ->
+      TermValue Nothing $ ValueFun $ \v ->
       case fromTuple v of Just [x,y] -> f x y
                           _ -> error $ "Expected pair; got: " ++ pretty v
     fun3t f =
-      TermValue Nothing $ ValueFun Nothing $ \v ->
+      TermValue Nothing $ ValueFun $ \v ->
       case fromTuple v of Just [x,y,z] -> f x y z
                           _ -> error $ "Expected triple; got: " ++ pretty v
 
     fun6t f =
-      TermValue Nothing $ ValueFun Nothing $ \v ->
+      TermValue Nothing $ ValueFun $ \v ->
       case fromTuple v of Just [x,y,z,a,b,c] -> f x y z a b c
                           _ -> error $ "Expected sextuple; got: " ++ pretty v
 
-    bopDef fs = fun2 (Just $ const ShapeLeaf) $ \x y ->
+    bopDef fs = fun2 $ \x y ->
       case (x, y) of
         (ValuePrim x', ValuePrim y')
           | Just z <- msum $ map (`bopDef'` (x', y')) fs ->
@@ -1144,7 +1127,7 @@ initialCtx =
               y' <- valf y
               retf =<< op x' y'
 
-    unopDef fs = fun1 (Just $ const ShapeLeaf) $ \x ->
+    unopDef fs = fun1 $ \x ->
       case x of
         (ValuePrim x')
           | Just r <- msum $ map (`unopDef'` x') fs ->
@@ -1156,7 +1139,7 @@ initialCtx =
               x' <- valf x
               retf =<< op x'
 
-    tbopDef f = fun1 (Just $ const ShapeLeaf) $ \v ->
+    tbopDef f = fun1 $ \v ->
       case fromTuple v of
         Just [ValuePrim x, ValuePrim y]
           | Just x' <- getV x,
@@ -1191,16 +1174,16 @@ initialCtx =
     def ">>" = Just $ bopDef $ sintOp P.AShr ++ uintOp P.LShr
     def "<<" = Just $ bopDef $ intOp P.Shl
     def ">>>" = Just $ bopDef $ sintOp P.LShr ++ uintOp P.LShr
-    def "==" = Just $ fun2 (Just $ const ShapeLeaf) $
+    def "==" = Just $ fun2 $
                \xs ys -> return $ ValuePrim $ BoolValue $ xs == ys
-    def "!=" = Just $ fun2 (Just $ const ShapeLeaf) $
+    def "!=" = Just $ fun2 $
                \xs ys -> return $ ValuePrim $ BoolValue $ xs /= ys
 
     -- The short-circuiting is handled directly in 'eval'; these cases
     -- are only used when partially applying and such.
-    def "&&" = Just $ fun2 (Just $ const ShapeLeaf) $ \x y ->
+    def "&&" = Just $ fun2 $ \x y ->
       return $ ValuePrim $ BoolValue $ asBool x && asBool y
-    def "||" = Just $ fun2 (Just $ const ShapeLeaf) $ \x y ->
+    def "||" = Just $ fun2 $ \x y ->
       return $ ValuePrim $ BoolValue $ asBool x || asBool y
 
     def "<" = Just $ bopDef $
@@ -1229,7 +1212,7 @@ initialCtx =
       | Just (pts, _, f) <- M.lookup s P.primFuns =
           case length pts of
             1 -> Just $ unopDef [(getV, Just . putV, f . pure)]
-            _ -> Just $ fun1 Nothing $ \x -> do
+            _ -> Just $ fun1 $ \x -> do
               let getV' (ValuePrim v) = getV v
                   getV' _ = Nothing
               case f =<< mapM getV' =<< fromTuple x of
@@ -1239,12 +1222,12 @@ initialCtx =
                   error $ "Cannot apply " ++ pretty s ++ " to " ++ pretty x
 
       | "sign_" `isPrefixOf` s =
-          Just $ fun1 Nothing $ \x ->
+          Just $ fun1 $ \x ->
           case x of (ValuePrim (UnsignedValue x')) ->
                       return $ ValuePrim $ SignedValue x'
                     _ -> error $ "Cannot sign: " ++ pretty x
       | "unsign_" `isPrefixOf` s =
-          Just $ fun1 Nothing $ \x ->
+          Just $ fun1 $ \x ->
           case x of (ValuePrim (SignedValue x')) ->
                       return $ ValuePrim $ UnsignedValue x'
                     _ -> error $ "Cannot unsign: " ++ pretty x
@@ -1255,11 +1238,17 @@ initialCtx =
     def s | "reduce_stream" `isPrefixOf` s =
               Just $ fun3t $ \_ f arg -> stream f arg
 
-    def "map" = Just $ fun2t $ \f xs -> do
-      let ValueFun (Just shapefun) _ = f
-          rowshape = shapefun $ rowShape $ valueShape xs
-      Debug.Trace.trace (unwords ["mapret", pretty rowshape, "xs", pretty xs]) $
-        toArray' rowshape <$> mapM (apply noLoc mempty f) (snd $ fromArray xs)
+    def "map" = Just $ TermPoly Nothing $ \t -> return $ ValueFun $ \v ->
+      case (fromTuple v, unfoldFunType t) of
+        (Just [f, xs], ([_], ret_t))
+          | Just rowshape <- typeRowShape ret_t ->
+              toArray' rowshape <$> mapM (apply noLoc mempty f) (snd $ fromArray xs)
+          | otherwise ->
+              error $ "Bad return type: " ++ pretty ret_t
+        _ ->
+          error $ "Invalid arguments to map intrinsic:\n" ++
+          unlines [pretty t, pretty v]
+      where typeRowShape = traverse id . structTypeShape mempty . stripArray 1
 
     def s | "reduce" `isPrefixOf` s = Just $ fun3t $ \f ne xs ->
       foldM (apply2 noLoc mempty f) ne $ snd $ fromArray xs
@@ -1316,7 +1305,7 @@ initialCtx =
     def "cmp_threshold" = Just $ fun2t $ \_ _ ->
       return $ ValuePrim $ BoolValue True
 
-    def "unzip" = Just $ fun1 Nothing $ \x -> do
+    def "unzip" = Just $ fun1 $ \x -> do
       let ShapeDim _ (ShapeRecord fs) = Debug.Trace.trace ("unzip " ++ pretty (valueShape x)) $ valueShape x
           Just [xs_shape, ys_shape] = areTupleFields fs
           listPair (xs, ys) =
@@ -1337,7 +1326,7 @@ initialCtx =
           (_, ys') = fromArray ys
       return $ toArray' rowshape $ xs' ++ ys'
 
-    def "transpose" = Just $ fun1 Nothing $ \xs -> do
+    def "transpose" = Just $ fun1 $ \xs -> do
       let (ShapeDim n (ShapeDim m shape), xs') = fromArray xs
       return $ toArray (ShapeDim m (ShapeDim n shape)) $
         map (toArray (ShapeDim n shape)) $ transpose $ map (snd . fromArray) xs'
@@ -1351,7 +1340,7 @@ initialCtx =
         else let (bef, aft) = splitFromEnd (-asInt i) xs'
              in toArray shape $ aft ++ bef
 
-    def "flatten" = Just $ fun1 Nothing $ \xs -> do
+    def "flatten" = Just $ fun1 $ \xs -> do
       let (ShapeDim n (ShapeDim m shape), xs') = fromArray xs
       return $ toArray (ShapeDim (n*m) shape) $ concatMap (snd . fromArray) xs'
 
@@ -1362,11 +1351,11 @@ initialCtx =
           v = toArray shape $ map (toArray rowshape) $ chunk (asInt m) xs'
       Debug.Trace.trace ("unflatten " ++show (valueShape v)) $ return v
 
-    def "opaque" = Just $ fun1 Nothing return
+    def "opaque" = Just $ fun1 return
 
-    def "trace" = Just $ fun1 Nothing $ \v -> trace v >> return v
+    def "trace" = Just $ fun1 $ \v -> trace v >> return v
 
-    def "break" = Just $ fun1 Nothing $ \v -> do
+    def "break" = Just $ fun1 $ \v -> do
       break
       return v
 
@@ -1404,6 +1393,8 @@ interpretFunction ctx fname vs = do
   ft <- case lookupVar (qualName fname) $ ctxEnv ctx of
           Just (TermValue (Just (T.BoundV _ t)) _) ->
             Right $ updateType (map valueType vs) t
+          Just (TermPoly (Just (T.BoundV _ t)) _) ->
+            Right $ updateType (map valueType vs) t
           _ ->
             Left $ "Unknown function `" <> prettyName fname <> "`."
 
@@ -1418,7 +1409,6 @@ interpretFunction ctx fname vs = do
   where updateType (vt:vts) (Scalar (Arrow als u _ rt)) =
           Scalar $ Arrow als u (valueStructType vt) $ updateType vts rt
         updateType _ t = t
-        valueStructType = first (ConstDim . fromIntegral)
 
         convertValue (F.PrimValue p) = Just $ ValuePrim p
         convertValue (F.ArrayValue arr t) = mkArray t =<< mapM convertValue (elems arr)

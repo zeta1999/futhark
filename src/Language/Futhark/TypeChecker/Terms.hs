@@ -19,8 +19,10 @@ import Control.Monad.Identity
 import Control.Monad.Except
 import Control.Monad.State
 import Control.Monad.RWS hiding (Sum)
+import Control.Monad.Writer hiding (Sum)
 import qualified Control.Monad.Fail as Fail
 import Data.Bifunctor
+import Data.Bitraversable
 import Data.Char (isAlpha)
 import Data.List
 import qualified Data.List.NonEmpty as NE
@@ -441,7 +443,7 @@ instantiateTypeScheme :: SrcLoc -> [TypeParam] -> PatternType
 instantiateTypeScheme loc tparams t = do
   let tnames = map typeParamName tparams
   (tparam_names, tparam_substs) <- unzip <$> mapM (instantiateTypeParam loc) tparams
-  (t', anydim_names) <- instantiateMissingDims loc t
+  (t', anydim_names) <- instantiateDimsInReturnType loc t
   let substs = M.fromList $ zip tnames tparam_substs
       t'' = substTypesAny (`M.lookup` substs) t'
   return (tparam_names ++ anydim_names, t'')
@@ -957,17 +959,20 @@ checkExp (Ascript e decl NoInfo loc) = do
   t'' <- matchDims (const pure) t' $ fromStruct decl_t'
   return $ Ascript e' decl' (Info t'') loc
 
-checkExp (BinOp (op, oploc) NoInfo (e1,_) (e2,_) NoInfo loc) = do
+checkExp (BinOp (op, oploc) NoInfo (e1,_) (e2,_) NoInfo NoInfo loc) = do
   (op', ftype) <- lookupVar oploc op
   e1_arg <- checkArg e1
   e2_arg <- checkArg e2
 
-  (p1_t, rt) <- checkApply loc ftype e1_arg
-  (p2_t, rt') <- checkApply loc rt e2_arg
+  -- Note that the application to the first operand cannot fix any
+  -- existential sizes, because it must by necessity be a function.
+  (p1_t, rt, p1_ext, _) <- checkApply loc ftype e1_arg
+  (p2_t, rt', p2_ext, retext) <- checkApply loc rt e2_arg
 
   return $ BinOp (op', oploc) (Info ftype)
-    (argExp e1_arg, Info $ toStruct p1_t) (argExp e2_arg, Info $ toStruct p2_t)
-    (Info rt') loc
+    (argExp e1_arg, Info (toStruct p1_t, p1_ext))
+    (argExp e2_arg, Info (toStruct p2_t, p2_ext))
+    (Info rt') (Info retext) loc
 
 checkExp (Project k e NoInfo loc) = do
   e' <- checkExp e
@@ -1036,12 +1041,12 @@ checkExp (Negate arg loc) = do
   arg' <- require "numeric negation" anyNumberType =<< checkExp arg
   return $ Negate arg' loc
 
-checkExp (Apply e1 e2 NoInfo NoInfo loc) = do
+checkExp (Apply e1 e2 NoInfo NoInfo NoInfo loc) = do
   e1' <- checkExp e1
   arg <- checkArg e2
   t <- expType e1'
-  (t1, rt) <- checkApply loc t arg
-  return $ Apply e1' (argExp arg) (Info $ diet t1) (Info rt) loc
+  (t1, rt, argext, exts) <- checkApply loc t arg
+  return $ Apply e1' (argExp arg) (Info (diet t1, argext)) (Info rt) (Info exts) loc
 
 checkExp (LetPat pat e body NoInfo loc) =
   sequentially (checkExp e) $ \e' e_occs -> do
@@ -1221,7 +1226,7 @@ checkExp (OpSection op _ loc) = do
 checkExp (OpSectionLeft op _ e _ _ loc) = do
   (op', ftype) <- lookupVar loc op
   e_arg <- checkArg e
-  (t1, rt) <- checkApply loc ftype e_arg
+  (t1, rt, argext, retext) <- checkApply loc ftype e_arg
   case rt of
     Scalar (Arrow _ _ t2 rettype) ->
       return $ OpSectionLeft op' (Info ftype) (argExp e_arg)
@@ -1234,7 +1239,7 @@ checkExp (OpSectionRight op _ e _ _ loc) = do
   e_arg <- checkArg e
   case ftype of
     Scalar (Arrow as1 m1 t1 (Scalar (Arrow as2 m2 t2 ret))) -> do
-      (t2', Scalar (Arrow _ _ t1' rettype)) <-
+      (t2', Scalar (Arrow _ _ t1' rettype), argext, retext) <-
         checkApply loc (Scalar $ Arrow as2 m2 t2 $ Scalar $ Arrow as1 m1 t1 ret) e_arg
       return $ OpSectionRight op' (Info ftype) (argExp e_arg)
         (Info $ toStruct t1', Info $ toStruct t2') (Info rettype) loc
@@ -1253,7 +1258,7 @@ checkExp (IndexSection idxes NoInfo loc) = do
   t' <- sliceShape loc idxes' t
   return $ IndexSection idxes' (Info $ fromStruct $ Scalar $ Arrow mempty Unnamed t t') loc
 
-checkExp (DoLoop mergepat mergeexp form loopbody loc) =
+checkExp (DoLoop _ mergepat mergeexp form loopbody NoInfo loc) =
   sequentially (checkExp mergeexp) $ \mergeexp' _ -> do
 
   zeroOrderType (mkUsage (srclocOf mergeexp) "use as loop variable")
@@ -1269,7 +1274,8 @@ checkExp (DoLoop mergepat mergeexp form loopbody loc) =
   --
   -- (2) The body of the loop is type-checked.  The result type is
   -- combined with the merge pattern type to determine which sizes are
-  -- variant, and these are set to AnyDim in the merge pattern.
+  -- variant, and these are turned into size parameters for the merge
+  -- pattern.
   --
   -- (3) We now conceptually have a function parameter type and return
   -- type.  We check that it can be called with the initial merge
@@ -1277,7 +1283,7 @@ checkExp (DoLoop mergepat mergeexp form loopbody loc) =
   -- as a whole.
   --
   -- (There is also a convergence loop for inferring uniqueness, but
-  -- that's orthogonal to the size handling.)that
+  -- that's orthogonal to the size handling.)
 
   (merge_t, new_dims) <-
     instantiateEmptyArrayDims loc Nonrigid . -- dim handling (1)
@@ -1306,19 +1312,26 @@ checkExp (DoLoop mergepat mergeexp form loopbody loc) =
                        anyDimOnMismatch pat_t' <$>
                        expType mergeexp'
 
-        -- Figure out which of the 'new_dims' dimensions are
-        -- variant.  This works because we know they are each only
-        -- used once.
+        -- Figure out which of the 'new_dims' dimensions are variant.
+        -- This works because we know that each dimension from
+        -- new_dims in the pattern is unique and distinct.
+        --
+        -- Our logic here is a bit reversed: the *mismatches* (from
+        -- new_dims) are what we want to extract and turn into size
+        -- parameters.
         let mismatchSubst (NamedDim v, d)
               | qualLeaf v `elem` new_dims =
                   case M.lookup v init_substs of
-                    Just d' | d' == d -> Just (qualLeaf v, SizeSubst d)
-                    _ -> Just (qualLeaf v, SizeSubst AnyDim)
-            mismatchSubst _ = Nothing
-            mismatches = M.fromList $ mapMaybe mismatchSubst $ snd $
-                         anyDimOnMismatch pat_t' loopbody_t'
+                    Just d' | d' == d -> return $ Just (qualLeaf v, SizeSubst d)
+                    _ -> do tell [qualLeaf v]
+                            return Nothing
+            mismatchSubst _ = return Nothing
 
-        return $ applySubst (`M.lookup` mismatches) mergepat'
+            (init_substs', sparams) =
+              runWriter $ M.fromList . catMaybes <$> mapM mismatchSubst
+              (snd $ anyDimOnMismatch pat_t loopbody_t')
+
+        return (sparams, applySubst (`M.lookup` init_substs') mergepat')
 
   -- First we do a basic check of the loop body to figure out which of
   -- the merge parameters are being consumed.  For this, we first need
@@ -1327,7 +1340,7 @@ checkExp (DoLoop mergepat mergeexp form loopbody loc) =
   --
   -- Play a little with occurences to ensure it does not look like
   -- none of the merge variables are being used.
-  ((mergepat', form', loopbody'), bodyflow) <-
+  ((sparams, mergepat', form', loopbody'), bodyflow) <-
     case form of
       For i uboundexp -> do
         uboundexp' <- require "being the bound in a 'for' loop" anySignedType =<< checkExp uboundexp
@@ -1336,8 +1349,9 @@ checkExp (DoLoop mergepat mergeexp form loopbody loc) =
           noUnique $ bindingPattern mergepat (Ascribed merge_t) $
           \mergepat' -> onlySelfAliasing $ tapOccurences $ do
             loopbody' <- checkExp loopbody
-            mergepat'' <- checkLoopReturnSize mergepat' loopbody'
-            return (mergepat'',
+            (sparams, mergepat'') <- checkLoopReturnSize mergepat' loopbody'
+            return (sparams,
+                    mergepat'',
                     For i' uboundexp',
                     loopbody')
 
@@ -1351,8 +1365,9 @@ checkExp (DoLoop mergepat mergeexp form loopbody loc) =
                 noUnique $ bindingPattern mergepat (Ascribed merge_t) $
                 \mergepat' -> onlySelfAliasing $ tapOccurences $ do
                   loopbody' <- checkExp loopbody
-                  mergepat'' <- checkLoopReturnSize mergepat' loopbody'
-                  return (mergepat'',
+                  (sparams, mergepat'') <- checkLoopReturnSize mergepat' loopbody'
+                  return (sparams,
+                          mergepat'',
                           ForIn xpat' e',
                           loopbody')
             | otherwise ->
@@ -1365,8 +1380,9 @@ checkExp (DoLoop mergepat mergeexp form loopbody loc) =
         sequentially (checkExp cond >>=
                       unifies "being the condition of a 'while' loop" (Scalar $ Prim Bool)) $ \cond' _ -> do
           loopbody' <- checkExp loopbody
-          mergepat'' <- checkLoopReturnSize mergepat' loopbody'
-          return (mergepat'',
+          (sparams, mergepat'') <- checkLoopReturnSize mergepat' loopbody'
+          return (sparams,
+                  mergepat'',
                   While cond',
                   loopbody')
 
@@ -1388,11 +1404,30 @@ checkExp (DoLoop mergepat mergeexp form loopbody loc) =
   consumeMerge mergepat'' =<< expType mergeexp'
 
   -- dim handling (3)
-  (merge_t', _) <- instantiateEmptyArrayDims loc Nonrigid $ toStruct $ patternType mergepat''
-  unify (mkUsage (srclocOf mergeexp') "matching initial loop values to pattern") merge_t' .
-    toStruct =<< expType mergeexp'
+  let sparams_anydim = M.fromList $ zip sparams $ repeat $ SizeSubst AnyDim
+      loopt_anydims = applySubst (`M.lookup` sparams_anydim) $
+                      patternType mergepat''
+  (merge_t', _) <-
+    instantiateEmptyArrayDims loc Nonrigid $ toStruct loopt_anydims
+  unify (mkUsage (srclocOf mergeexp') "matching initial loop values to pattern")
+    merge_t' . toStruct =<< expType mergeexp'
 
-  return $ DoLoop mergepat'' mergeexp' form' loopbody' loc
+  (loopt, retext) <- instantiateDimsInReturnType loc loopt_anydims
+  -- We set all of the uniqueness to be unique.  This is intentional,
+  -- and matches what happens for function calls.  Those arrays that
+  -- really *cannot* be consumed will alias something unconsumable,
+  -- and will be caught that way.
+  let bound_here = S.map identName (patternIdents mergepat'') <>
+                   S.fromList sparams <> form_bound
+      form_bound =
+        case form' of
+          For v _ -> S.singleton $ identName v
+          ForIn forpat _ -> S.map identName (patternIdents forpat)
+          While{} -> mempty
+      loopt' = second (`S.difference` S.map AliasBound bound_here) $
+               loopt `setUniqueness` Unique
+
+  return $ DoLoop sparams mergepat'' mergeexp' form' loopbody' (Info (loopt', retext)) loc
 
   where
     convergePattern pat body_cons body_t body_loc = do
@@ -1764,14 +1799,38 @@ checkArg arg = do
   arg_t <- expType arg'
   return (arg', arg_t, dflow, srclocOf arg')
 
+instantiateDimsInReturnType :: SrcLoc -> TypeBase (DimDecl VName) als
+                            -> TermTypeM (TypeBase (DimDecl VName) als, [VName])
+instantiateDimsInReturnType tloc = runWriterT . go
+  where go :: TypeBase (DimDecl VName) als
+           -> WriterT [VName] TermTypeM (TypeBase (DimDecl VName) als)
+        go t@Array{} = bitraverse onDim pure t
+        go (Scalar (Record fields)) = Scalar . Record <$> traverse go fields
+        go (Scalar (TypeVar as u tn targs)) =
+          Scalar <$> (TypeVar as u tn <$> mapM onTypeArg targs)
+        go (Scalar (Sum cs)) = Scalar . Sum <$> traverse (mapM go) cs
+        go t@(Scalar Prim{}) = return t
+        go t@(Scalar Arrow{}) = return t
+
+        onTypeArg (TypeArgDim d loc) =
+          TypeArgDim <$> onDim d <*> pure loc
+        onTypeArg (TypeArgType t loc) =
+          TypeArgType <$> go t <*> pure loc
+
+        onDim AnyDim = do
+          dim <- lift $ newDimVar tloc Rigid "dim"
+          tell [dim]
+          return $ NamedDim $ qualName dim
+        onDim d = return d
+
 checkApply :: SrcLoc -> PatternType -> Arg
-           -> TermTypeM (PatternType, PatternType)
+           -> TermTypeM (PatternType, PatternType, Maybe VName, [VName])
 checkApply loc (Scalar funt@(Arrow as pname tp1 tp2)) (argexp, argtype, dflow, argloc) = do
   expect (mkUsage argloc "use as function argument") (toStruct tp1) (toStruct argtype)
 
   -- Perform substitutions of instantiated variables in the types.
   tp1' <- normaliseType tp1
-  tp2' <- normaliseType tp2
+  (tp2', ext) <- instantiateDimsInReturnType loc =<< normaliseType tp2
   argtype' <- normaliseType argtype
 
   occur [observation as loc]
@@ -1786,18 +1845,22 @@ checkApply loc (Scalar funt@(Arrow as pname tp1 tp2)) (argexp, argtype, dflow, a
     _ -> return ()
 
   occur $ dflow `seqOccurences` occurs
-  parsubst <- case pname of
-                Named pname' ->
-                  flip M.lookup . M.singleton pname' .
-                  SizeSubst <$> sizeSubst tp1' argexp
-                _ -> return $ const Nothing
+  (argext, parsubst) <-
+    case pname of
+      Named pname' -> do
+        d <- sizeSubst tp1' argexp
+        return (case d of
+                  NamedDim d' -> Just $ qualLeaf d'
+                  _ -> Nothing,
+                (`M.lookup` M.singleton pname' (SizeSubst d)))
+      _ -> return (Nothing, const Nothing)
   let tp2'' = applySubst parsubst $ returnType tp2' (diet tp1') argtype'
   let msg = unlines ["argument " ++ prettyOneLine argexp,
                      pretty funt,
                      pretty argtype,
                      pretty tp1',
                      pretty tp2'']
-  return (tp1', tp2'')
+  return (tp1', tp2'', argext, ext)
   where sizeSubst (Scalar (Prim (Signed Int32))) e = dimFromArg e
         sizeSubst _ _ = return AnyDim
 
@@ -1939,6 +2002,10 @@ checkFunDef (fname, maybe_retdecl, tparams, params, body, loc) =
     when (nameToString fname `elem` doNotShadow) $
       typeError loc $ "The " ++ nameToString fname ++ " operator may not be redefined."
 
+    let msg = unlines [prettyName fname',
+                       pretty tparams',
+                       pretty params'',
+                       pretty rettype'']
     return (fname', tparams', params'', maybe_retdecl'', rettype'', body'')
 
 -- | This is "fixing" as in "setting them", not "correcting them".  We
@@ -2411,7 +2478,7 @@ removeUnboundSizes bound x = do
   constraints <- getConstraints
   let onType t =
         let anyDimIfUnknown v
-              | v `S.member` bound || v `M.notMember` constraints = mempty
+              | True || v `S.member` bound || v `M.notMember` constraints = mempty
               | otherwise = M.singleton v $ SizeSubst AnyDim
             t' = applySubst (`lookupSubst` constraints) t
             dim_substs = mconcat $ map anyDimIfUnknown $ S.toList $ typeDimNames t'

@@ -251,12 +251,12 @@ defuncExp (If e1 e2 e3 tp loc) = do
   (e3', _ ) <- defuncExp e3
   return (If e1' e2' e3' tp loc, sv)
 
-defuncExp e@(Apply f@(Var f' _ _) arg d t loc)
+defuncExp e@(Apply f@(Var f' _ _) arg d t ext loc)
   | baseTag (qualLeaf f') <= maxIntrinsicTag,
     TupLit es tuploc <- arg = do
       -- defuncSoacExp also works fine for non-SOACs.
       es' <- mapM defuncSoacExp es
-      return (Apply f (TupLit es' tuploc) d t loc,
+      return (Apply f (TupLit es' tuploc) d t ext loc,
               Dynamic $ typeOf e)
 
 defuncExp e@Apply{} = defuncApply 0 e
@@ -276,7 +276,7 @@ defuncExp OpSectionRight{} = error "defuncExp: unexpected operator section."
 defuncExp ProjectSection{} = error "defuncExp: unexpected projection section."
 defuncExp IndexSection{}   = error "defuncExp: unexpected projection section."
 
-defuncExp (DoLoop pat e1 form e3 loc) = do
+defuncExp (DoLoop sparams pat e1 form e3 ret loc) = do
   (e1', sv1) <- defuncExp e1
   let env1 = matchPatternSV pat sv1
   (form', env2) <- case form of
@@ -287,15 +287,18 @@ defuncExp (DoLoop pat e1 form e3 loc) = do
     While e2      -> do e2' <- localEnv env1 $ defuncExp' e2
                         return (While e2', mempty)
   (e3', sv) <- localEnv (env1 <> env2) $ defuncExp e3
-  return (DoLoop pat e1' form' e3' loc, sv)
+  return (DoLoop sparams pat e1' form' e3' ret loc, sv)
   where envFromIdent (Ident vn (Info tp) _) =
           M.singleton vn $ Dynamic tp
 
 -- We handle BinOps by turning them into ordinary function applications.
-defuncExp (BinOp (qn, qnloc) (Info t) (e1, Info pt1) (e2, Info pt2) (Info ret) loc) =
+defuncExp (BinOp (qn, qnloc) (Info t)
+           (e1, Info (pt1, ext1)) (e2, Info (pt2, ext2))
+           (Info ret) (Info retext) loc) =
   defuncExp $ Apply (Apply (Var qn (Info t) qnloc)
-                     e1 (Info (diet pt1)) (Info (Scalar $ Arrow mempty Unnamed (fromStruct pt2) ret)) loc)
-                    e2 (Info (diet pt2)) (Info ret) loc
+                     e1 (Info (diet pt1, ext1))
+                     (Info (Scalar $ Arrow mempty Unnamed (fromStruct pt2) ret)) (Info []) loc)
+                    e2 (Info (diet pt2, ext2)) (Info ret) (Info retext) loc
 
 defuncExp (Project vn e0 tp@(Info tp') loc) = do
   (e0', sv0) <- defuncExp e0
@@ -430,8 +433,8 @@ etaExpand e = do
     return (Id x (Info t) noLoc,
             Var (qualName x) (Info t) noLoc)
   let e' = foldl' (\e1 (e2, t2, argtypes) ->
-                     Apply e1 e2 (Info $ diet t2)
-                     (Info (foldFunType argtypes ret)) noLoc)
+                     Apply e1 e2 (Info (diet t2, Nothing))
+                     (Info (foldFunType argtypes ret)) (Info []) noLoc)
            e $ zip3 vars ps (drop 1 $ tails ps)
   return (pats, e', toStruct ret)
 
@@ -475,11 +478,11 @@ defuncLet _ [] body (Info rettype) = do
 -- but a new lifted function is created if a dynamic function is only partially
 -- applied.
 defuncApply :: Int -> Exp -> DefM (Exp, StaticVal)
-defuncApply depth e@(Apply e1 e2 d t@(Info ret) loc) = do
+defuncApply depth e@(Apply e1 e2 d t@(Info ret) (Info ext) loc) = do
   let (argtypes, _) = unfoldFunType ret
   (e1', sv1) <- defuncApply (depth+1) e1
   (e2', sv2) <- defuncExp e2
-  let e' = Apply e1' e2' d t loc
+  let e' = Apply e1' e2' d t (Info ext) loc
   case sv1 of
     LambdaSV dims pat e0_t e0 closure_env -> do
       let env' = matchPatternSV pat sv2
@@ -505,7 +508,7 @@ defuncApply depth e@(Apply e1 e2 d t@(Info ret) loc) = do
           -- result slightly more human-readable.
           liftedName i (Var f _ _) =
             "lifted_" ++ show i ++ "_" ++ baseString (qualLeaf f)
-          liftedName i (Apply f _ _ _ _) =
+          liftedName i (Apply f _ _ _ _ _) =
             liftedName (i+1) f
           liftedName _ _ = "lifted"
       fname <- newNameFromString $ liftedName (0::Int) e1
@@ -514,10 +517,14 @@ defuncApply depth e@(Apply e1 e2 d t@(Info ret) loc) = do
       let t1 = toStruct $ typeOf e1'
           t2 = toStruct $ typeOf e2'
           fname' = qualName fname
-      return (Parens (Apply (Apply (Var fname' (Info (Scalar $ Arrow mempty Unnamed (fromStruct t1) $
-                                                      Scalar $ Arrow mempty Unnamed (fromStruct t2) rettype)) loc)
-                             e1' (Info Observe) (Info $ Scalar $ Arrow mempty Unnamed (fromStruct t2) rettype) loc)
-                      e2' d (Info rettype) loc) noLoc, sv)
+          fname'' = Var fname' (Info (Scalar $ Arrow mempty Unnamed (fromStruct t1) $
+                                      Scalar $ Arrow mempty Unnamed (fromStruct t2) rettype))
+                    loc
+      return (Parens (Apply (Apply fname'' e1'
+                              (Info (Observe, Nothing))
+                              (Info $ Scalar $ Arrow mempty Unnamed (fromStruct t2) rettype)
+                              (Info []) loc)
+                      e2' d (Info rettype) (Info []) loc) noLoc, sv)
 
     -- If e1 is a dynamic function, we just leave the application in place,
     -- but we update the types since it may be partially applied or return
@@ -525,7 +532,7 @@ defuncApply depth e@(Apply e1 e2 d t@(Info ret) loc) = do
     DynamicFun _ sv ->
       let (argtypes', rettype) = dynamicFunType sv argtypes
           apply_e = Apply e1' e2' d (Info $ foldFunType argtypes' rettype
-                                    `setAliases` aliases ret) loc
+                                    `setAliases` aliases ret) (Info []) loc
       in return (apply_e, sv)
 
     -- Propagate the 'IntrinsicsSV' until we reach the outermost application,
@@ -823,7 +830,7 @@ freeVars expr = case expr of
     (freeVars e2 `without` oneName vn)
 
   If e1 e2 e3 _ _           -> freeVars e1 <> freeVars e2 <> freeVars e3
-  Apply e1 e2 _ _ _         -> freeVars e1 <> freeVars e2
+  Apply e1 e2 _ _ _ _       -> freeVars e1 <> freeVars e2
   Negate e _                -> freeVars e
   Lambda pats e0 _ _ _      -> (names (foldMap patternDimNames pats) <> freeVars e0)
                                `without` foldMap patternVars pats
@@ -833,15 +840,17 @@ freeVars expr = case expr of
   ProjectSection{}            -> mempty
   IndexSection idxs _ _       -> foldMap freeDimIndex idxs
 
-  DoLoop pat e1 form e3 _ -> let (e2fv, e2ident) = formVars form
-                             in freeVars e1 <> e2fv <>
-                             (freeVars e3 `without` (patternVars pat <> e2ident))
+  DoLoop sparams pat e1 form e3 _ _ ->
+    let (e2fv, e2ident) = formVars form
+    in freeVars e1 <> e2fv <>
+       (freeVars e3 `without`
+        (names (S.fromList sparams) <> patternVars pat <> e2ident))
     where formVars (For v e2) = (freeVars e2, ident v)
           formVars (ForIn p e2)   = (freeVars e2, patternVars p)
           formVars (While e2)     = (freeVars e2, mempty)
 
-  BinOp (qn, _) _ (e1, _) (e2, _) _ _ -> oneName (qualLeaf qn) <>
-                                         freeVars e1 <> freeVars e2
+  BinOp (qn, _) _ (e1, _) (e2, _) _ _ _ -> oneName (qualLeaf qn) <>
+                                           freeVars e1 <> freeVars e2
   Project _ e _ _                -> freeVars e
 
   LetWith id1 id2 idxs e1 e2 _ _ ->
