@@ -158,7 +158,7 @@ onKernel target kernel = do
       const_defs = mapMaybe constDef $ kernelUses kernel
 
   let (safety, error_init)
-        | length (kernelFailures kstate) == length failures =
+        | False, length (kernelFailures kstate) == length failures =
             if kernelFailureTolerant kernel
             then (SafetyNone, [])
             else -- No possible failures in this kernel, so if we make
@@ -167,7 +167,7 @@ onKernel target kernel = do
                   [C.citems|if (*global_failure >= 0) { return; }|])
 
         | otherwise =
-            if not (kernelHasBarriers kstate)
+            if False && not (kernelHasBarriers kstate)
             then (SafetyFull,
                   [C.citems|if (*global_failure >= 0) { return; }|])
             else (SafetyFull,
